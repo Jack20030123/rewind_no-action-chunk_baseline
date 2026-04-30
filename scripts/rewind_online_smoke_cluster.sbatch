@@ -84,9 +84,19 @@ echo "wandb=${WANDB_ENTITY}/${WANDB_PROJECT} group=${GROUP_NAME}"
 echo "node=${SLURM_NODELIST:-}"
 nvidia-smi || true
 
-test -f "${OFFLINE_H5}"
-test -f "${OFFLINE_CKPT}.zip"
-test -f "${REWIND_CKPT}"
+check_file() {
+  local label="$1"
+  local path="$2"
+  if [ ! -f "${path}" ]; then
+    echo "ERROR: missing ${label}: ${path}" >&2
+    return 1
+  fi
+  echo "found ${label}: ${path}"
+}
+
+check_file "offline H5" "${OFFLINE_H5}"
+check_file "offline checkpoint zip" "${OFFLINE_CKPT}.zip"
+check_file "ReWiND reward checkpoint" "${REWIND_CKPT}"
 
 srun python -u test_scripts/test_iql.py \
   metaworld=off_on_15 \
