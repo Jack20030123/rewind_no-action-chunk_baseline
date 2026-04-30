@@ -1,0 +1,7 @@
+# @package _global_
+
+reward_model: 
+  name: 'roboclip'
+  batch_size: 64
+  model_path: null
+  success_bonus: 10.0

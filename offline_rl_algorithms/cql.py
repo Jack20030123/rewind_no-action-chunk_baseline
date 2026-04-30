@@ -1,0 +1,546 @@
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, TypeVar, Union
+
+import numpy as np
+import torch as th
+from gym import spaces
+from torch.nn import functional as F
+import time
+
+from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.noise import ActionNoise
+from offline_rl_algorithms.base_offline_rl_algorithm import OfflineRLAlgorithm
+from stable_baselines3.common.policies import BasePolicy
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
+from offline_rl_algorithms.custom_policies import (
+    CustomActor,
+    CustomSACPolicy,
+    CustomCnnPolicy,
+    CustomMlpPolicy,
+    CustomMultiInputPolicy,
+)
+
+
+class CQL(OfflineRLAlgorithm):
+    """
+    CQL and Cal-QL both implemented in this
+
+    :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
+    :param env: The environment to learn from (if registered in Gym, can be str)
+    :param learning_rate: learning rate for adam optimizer,
+        the same learning rate will be used for all networks (Q-Values, Actor and Value function)
+        it can be a function of the current progress remaining (from 1 to 0)
+    :param buffer_size: size of the replay buffer
+    :param learning_starts: how many steps of the model to collect transitions for before learning starts
+    :param batch_size: Minibatch size for each gradient update
+    :param tau: the soft update coefficient ("Polyak update", between 0 and 1)
+    :param gamma: the discount factor
+    :param train_freq: Update the model every ``train_freq`` steps. Alternatively pass a tuple of frequency and unit
+        like ``(5, "step")`` or ``(2, "episode")``.
+    :param gradient_steps: How many gradient steps to do after each rollout (see ``train_freq``)
+        Set to ``-1`` means to do as many gradient steps as steps done in the environment
+        during the rollout.
+    :param action_noise: the action noise type (None by default), this can help
+        for hard exploration problem. Cf common.noise for the different action noise type.
+    :param replay_buffer_class: Replay buffer class to use (for instance ``HerReplayBuffer``).
+        If ``None``, it will be automatically selected.
+    :param replay_buffer_kwargs: Keyword arguments to pass to the replay buffer on creation.
+    :param optimize_memory_usage: Enable a memory efficient variant of the replay buffer
+        at a cost of more complexity.
+        See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
+    :param ent_coef: Entropy regularization coefficient. (Equivalent to
+        inverse of reward scale in the original SAC paper.)  Controlling exploration/exploitation trade-off.
+        Set it to 'auto' to learn it automatically (and 'auto_0.1' for using 0.1 as initial value)
+    :param target_update_interval: update the target network every ``target_network_update_freq``
+        gradient steps.
+    :param target_entropy: target entropy when learning ``ent_coef`` (``ent_coef = 'auto'``)
+    :param use_sde: Whether to use generalized State Dependent Exploration (gSDE)
+        instead of action noise exploration (default: False)
+    :param sde_sample_freq: Sample a new noise matrix every n steps when using gSDE
+        Default: -1 (only sample at the beginning of the rollout)
+    :param use_sde_at_warmup: Whether to use gSDE instead of uniform sampling
+        during the warm up phase (before learning starts)
+    :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
+        the reported success rate, mean episode length, and mean reward over
+    :param tensorboard_log: the log location for tensorboard (if None, no logging)
+    :param policy_kwargs: additional arguments to be passed to the policy on creation
+    :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
+        debug messages
+    :param seed: Seed for the pseudo random generators
+    :param device: Device (cpu, cuda, ...) on which the code should be run.
+        Setting it to auto, the code will be run on the GPU if possible.
+    :param _init_setup_model: Whether or not to build the network at the creation of the instance
+    :param min_q_weight: Weight for the min_q loss for CQL
+    :param min_q_temp: Temperature parameter for the min_q loss for CQL
+    :param use_calibrated_q: Whether to use calibrated Q for CQL (Cal-QL algorithm)
+    :param critic_update_ratio: Number of critic updates per actor update
+    :param n_critics_to_sample: Number of critics to sample from
+    :param warm_start_online_rl: Whether to warm start the online RL agent with the offline RL agent
+    """
+
+    policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
+        "MlpPolicy": CustomMlpPolicy,
+        "CnnPolicy": CustomCnnPolicy,
+        "MultiInputPolicy": CustomMultiInputPolicy,
+    }
+    policy: CustomSACPolicy
+    actor: CustomActor
+    # critic: CustomContinuousCritic
+    # critic_target: CustomContinuousCritic
+
+    def __init__(
+        self,
+        policy: Union[str, Type[CustomSACPolicy]],
+        env: Union[GymEnv, str],
+        learning_rate: Union[float, Schedule] = 3e-4,
+        buffer_size: int = 1_000_000,  # 1e6
+        learning_starts: int = 100,
+        batch_size: int = 256,
+        tau: float = 0.005,
+        gamma: float = 0.99,
+        train_freq: Union[int, Tuple[int, str]] = 1,
+        gradient_steps: int = 1,
+        action_noise: Optional[ActionNoise] = None,
+        replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
+        replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
+        optimize_memory_usage: bool = False,
+        ent_coef: Union[str, float] = "auto",
+        target_update_interval: int = 1,
+        target_entropy: Union[str, float] = "auto",
+        use_sde: bool = False,
+        sde_sample_freq: int = -1,
+        use_sde_at_warmup: bool = False,
+        stats_window_size: int = 100,
+        tensorboard_log: Optional[str] = None,
+        policy_kwargs: Optional[Dict[str, Any]] = None,
+        verbose: int = 0,
+        seed: Optional[int] = None,
+        device: Union[th.device, str] = "auto",
+        _init_setup_model: bool = True,
+        min_q_weight: float = 5.0,
+        min_q_temp: float = 1.0,
+        use_calibrated_q: bool = False,
+        offline_critic_update_ratio: int = 1,  # number of critic updates per actor update
+        online_critic_update_ratio: int = 1,  # number of critic updates per actor update
+        n_critics_to_sample: int = 2,  # number of critics to sample from
+        warm_start_online_rl: bool = True,
+    ):
+        super().__init__(
+            policy,
+            env,
+            learning_rate,
+            buffer_size,
+            learning_starts,
+            batch_size,
+            tau,
+            gamma,
+            train_freq,
+            gradient_steps,
+            action_noise,
+            replay_buffer_class=replay_buffer_class,
+            replay_buffer_kwargs=replay_buffer_kwargs,
+            policy_kwargs=policy_kwargs,
+            stats_window_size=stats_window_size,
+            tensorboard_log=tensorboard_log,
+            verbose=verbose,
+            device=device,
+            seed=seed,
+            use_sde=use_sde,
+            sde_sample_freq=sde_sample_freq,
+            use_sde_at_warmup=use_sde_at_warmup,
+            optimize_memory_usage=optimize_memory_usage,
+            supported_action_spaces=(spaces.Box,),
+            support_multi_env=True,
+            warm_start_online_rl=warm_start_online_rl,
+        )
+
+        self.target_entropy = target_entropy
+        self.log_ent_coef = None  # type: Optional[th.Tensor]
+        # Entropy coefficient / Entropy temperature
+        # Inverse of the reward scale
+        self.ent_coef = ent_coef
+        self.target_update_interval = target_update_interval
+        self.ent_coef_optimizer: Optional[th.optim.Adam] = None
+
+        if _init_setup_model:
+            self._setup_model()
+
+        self.min_q_weight = min_q_weight
+        self.temp = min_q_temp
+        self.online_critic_update_ratio = online_critic_update_ratio
+        self.offline_critic_update_ratio = offline_critic_update_ratio
+        self.current_critic_update_ratio = self.offline_critic_update_ratio
+        self.n_critics_to_sample = n_critics_to_sample
+
+        self.use_calibrated_q = use_calibrated_q
+
+        if self.use_calibrated_q:
+            self.name = "cal-ql"
+        else:
+            self.name = "cql"
+
+    def _setup_model(self) -> None:
+        super()._setup_model()
+        self._create_aliases()
+        # Running mean and running var
+        self.batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
+        self.batch_norm_stats_target = get_parameters_by_name(
+            self.critic_target, ["running_"]
+        )
+        # Target entropy is used when learning the entropy coefficient
+        if self.target_entropy == "auto":
+            # automatically set target entropy if needed
+            self.target_entropy = float(
+                -np.prod(self.env.action_space.shape).astype(np.float32)
+            )  # type: ignore
+        else:
+            # Force conversion
+            # this will also throw an error for unexpected string
+            self.target_entropy = float(self.target_entropy)
+
+        # The entropy coefficient or entropy can be learned automatically
+        # see Automating Entropy Adjustment for Maximum Entropy RL section
+        # of https://arxiv.org/abs/1812.05905
+        if isinstance(self.ent_coef, str) and self.ent_coef.startswith("auto"):
+            # Default initial value of ent_coef when learned
+            init_value = 1.0
+            if "_" in self.ent_coef:
+                init_value = float(self.ent_coef.split("_")[1])
+                assert (
+                    init_value > 0.0
+                ), "The initial value of ent_coef must be greater than 0"
+
+            # Note: we optimize the log of the entropy coeff which is slightly different from the paper
+            # as discussed in https://github.com/rail-berkeley/softlearning/issues/37
+            self.log_ent_coef = th.log(
+                th.ones(1, device=self.device) * init_value
+            ).requires_grad_(True)
+            self.ent_coef_optimizer = th.optim.Adam(
+                [self.log_ent_coef], lr=self.lr_schedule(1)
+            )
+        else:
+            # Force conversion to float
+            # this will throw an error if a malformed string (different from 'auto')
+            # is passed
+            self.ent_coef_tensor = th.tensor(float(self.ent_coef), device=self.device)
+
+    def _create_aliases(self) -> None:
+        self.actor = self.policy.actor
+        self.critic = self.policy.critic.to(th.float32)
+        self.critic_target = self.policy.critic_target
+
+    def train(
+        self, gradient_steps: int, batch_size: int = 64, logging_prefix: str = "train"
+    ) -> None:
+        # Switch to train mode (this affects batch norm / dropout)
+        self.policy.set_training_mode(True)
+        # Update optimizers learning rate
+        optimizers = [self.actor.optimizer, self.critic.optimizer]
+        if self.ent_coef_optimizer is not None:
+            optimizers += [self.ent_coef_optimizer]
+
+        # Update learning rate according to lr schedule
+        self._update_learning_rate(optimizers)
+
+        ent_coef_losses, ent_coefs = [], []
+        actor_losses, critic_losses = [], []
+        q_values = []
+        q_next_values = []
+        actor_log_pis = []
+        reward_values = []
+        cql_losses = []
+
+        for gradient_step in range(gradient_steps):
+            # We need to sample because `log_std` may have changed between two gradient steps
+            if self.use_sde:
+                self.actor.reset_noise()
+
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                ent_coef = th.exp(self.log_ent_coef.detach())
+            else:
+                ent_coef = self.ent_coef_tensor
+
+            for critic_update in range(self.current_critic_update_ratio):
+                # Sample replay buffer
+                replay_data = self.replay_buffer.sample(
+                    batch_size, env=self._vec_normalize_env
+                )  # type: ignore[union-attr]
+
+                with th.no_grad():
+                    # Select action according to policy
+                    next_actions, next_log_prob = self.actor.action_log_prob(
+                        replay_data.next_observations
+                    )
+                    # Compute the next Q values: min over a subset of critics targets (for generality with REDQ implementation)
+                    critic_indices = th.randperm(self.policy_kwargs["n_critics"])[
+                        : self.n_critics_to_sample
+                    ]
+                    next_q_values = th.cat(
+                        self.critic_target(
+                            replay_data.next_observations,
+                            next_actions,
+                            critic_indices=critic_indices,
+                        ),
+                        dim=1,
+                    )
+                    next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                    # add entropy term
+                    next_q_values = next_q_values - ent_coef * next_log_prob.reshape(
+                        -1, 1
+                    )
+                    # td error + entropy term
+                    target_q_values = (
+                        replay_data.rewards
+                        + (1 - replay_data.dones) * self.gamma * next_q_values
+                    )
+
+                # CQL Implementation
+                random_actions = (
+                    th.FloatTensor(batch_size, self.action_space.shape[0])
+                    .uniform_(-1, 1)
+                    .to(self.device)
+                )
+                # Sample policy actions to calculate the CQL loss
+                current_actions, current_log_pis = self.actor.action_log_prob(
+                    replay_data.observations
+                )
+                next_actions, next_log_pis = self.actor.action_log_prob(
+                    replay_data.next_observations
+                )
+
+                current_log_pis = current_log_pis.reshape(-1, 1)
+                next_log_pis = next_log_pis.reshape(-1, 1)
+                # Compute the Q values of random actions
+                # q1_rand, q2_rand = self.critic(replay_data.observations, random_actions)
+                q_rand = th.cat(
+                    self.critic(replay_data.observations, random_actions), 1
+                )
+                # q1_current_actions, q2_current_actions = self.critic(
+                #     replay_data.observations, replay_data.actions
+                # )
+                q_current_actions = th.cat(
+                    self.critic(replay_data.observations, current_actions), 1
+                )
+                # q1_next_actions, q2_next_actions = self.critic(
+                # replay_data.observations, next_actions
+                # )
+                q_next_actions = th.cat(
+                    self.critic(replay_data.observations, next_actions), 1
+                )
+
+                # importance sampled version of CQL for cat_q1 and cat_q2
+                random_density = np.log(0.5 ** current_actions.shape[-1])
+                # cat_q1 = th.cat(
+                #     [
+                #         q1_rand - random_density,
+                #         q1_next_actions - next_log_pis.detach(),
+                #         q1_current_actions - current_log_pis.detach(),
+                #     ],
+                #     1,
+                # )
+                # shape is (batch_size, 3)
+                # cat_q2 = th.cat(
+                #     [
+                #         q2_rand - random_density,
+                #         q2_next_actions - next_log_pis.detach(),
+                #         q2_current_actions - current_log_pis.detach(),
+                #     ],
+                #     1,
+                # )
+                # shape should be (batch_size, 10, 3)
+                if self.use_calibrated_q:
+                    cal_ql_lower_bounds = replay_data.mc_returns.expand_as(
+                        q_current_actions
+                    )
+                    bound_rate_cal_ql = (
+                        (q_current_actions < cal_ql_lower_bounds).float().mean()
+                    )
+                    bound_rate_next_cal_ql = (
+                        (q_next_actions < cal_ql_lower_bounds).float().mean()
+                    )
+
+                    import random
+
+                    if random.random() < 0.1:
+                        print(f"Bound rate next cal ql {bound_rate_next_cal_ql}")
+                        print(f"Bound rate cal ql {bound_rate_cal_ql}")
+                        print("q current max", q_current_actions.max())
+                        print("qlower max", cal_ql_lower_bounds.max())
+                        print()
+
+                    q_current_actions = th.max(q_current_actions, cal_ql_lower_bounds)
+                    q_next_actions = th.max(q_next_actions, cal_ql_lower_bounds)
+
+                cat_qs = th.cat(
+                    [
+                        q_rand[:, :, None] - random_density,
+                        q_next_actions[:, :, None] - next_log_pis.detach()[:, None],
+                        q_current_actions[:, :, None]
+                        - current_log_pis.detach()[:, None],
+                    ],
+                    dim=-1,
+                )
+
+                # cql_min_qf1_loss = (
+                #     th.logsumexp(cat_q1 / self.temp, dim=1).mean()
+                #     * self.min_q_weight
+                #     * self.temp
+                # )
+                # cql_min_qf2_loss = (
+                #     th.logsumexp(cat_q2 / self.temp, dim=1).mean()
+                #     * self.min_q_weight
+                #     * self.temp
+                # )
+
+                cql_min_qf_loss = (
+                    th.logsumexp(cat_qs / self.temp, dim=-1).mean(dim=0)
+                    * self.min_q_weight
+                    * self.temp
+                )
+
+                # cql_min_qf1_loss = (
+                #     cql_min_qf1_loss - q1_current_actions.mean() * self.min_q_weight
+                # )
+                # cql_min_qf2_loss = (
+                #     cql_min_qf2_loss - q2_current_actions.mean() * self.min_q_weight
+                # )
+
+                cql_min_qf_loss = (
+                    cql_min_qf_loss - q_current_actions.mean(dim=0) * self.min_q_weight
+                )
+
+                # critic_loss = 1/self.n_critics_to_sample * sum(
+                #     F.mse_loss(current_q, target_q_values)
+                #     for current_q in [q1_current_actions, q2_current_actions]
+                # )
+
+                critic_loss = F.mse_loss(
+                    q_current_actions, target_q_values.expand_as(q_current_actions)
+                )
+
+                critic_loss += th.sum(cql_min_qf_loss)
+
+                critic_losses.append(critic_loss.item())
+                cql_losses.append(cql_min_qf_loss.sum().item())
+
+                # log q1 and q2 values
+                q_values.append(q_current_actions.mean().item())
+
+                # log next q1 and q2 values
+                q_next_values.append(q_next_actions.mean().item())
+
+                # log average in batch reward
+                reward_values.append(replay_data.rewards.mean().item())
+
+                self.critic.optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic.optimizer.step()
+
+                # target network update
+                if gradient_step % self.target_update_interval == 0:
+                    polyak_update(
+                        self.critic.parameters(),
+                        self.critic_target.parameters(),
+                        self.tau,
+                    )
+                    polyak_update(
+                        self.batch_norm_stats, self.batch_norm_stats_target, 1.0
+                    )
+            # Action by the current actor for the sampled state
+            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+            log_prob = log_prob.reshape(-1, 1)
+            ent_coef_loss = None
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                # Important: detach the variable from the graph
+                # so we don't change it with other losses
+                # see https://github.com/rail-berkeley/softlearning/issues/60
+                ent_coef_loss = -(
+                    self.log_ent_coef * (log_prob + self.target_entropy).detach()
+                ).mean()
+                ent_coef_losses.append(ent_coef_loss.item())
+            else:
+                ent_coef = self.ent_coef_tensor
+
+            ent_coefs.append(ent_coef.item())
+
+            # Optimize entropy coefficient, also called
+            # entropy temperature or alpha in the paper
+            if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+            q_values_pi = th.cat(
+                self.critic(replay_data.observations, actions_pi), dim=1
+            )
+            min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+            actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+            actor_losses.append(actor_loss.item())
+
+            actor_log_pis.append(log_prob.mean().item())
+
+            self.actor.optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor.optimizer.step()
+
+        self._n_updates += gradient_steps
+
+        metrics_dict = {
+            f"{logging_prefix}/ent_coef": np.mean(ent_coefs),
+            f"{logging_prefix}/actor_loss": np.mean(actor_losses),
+            f"{logging_prefix}/critic_loss": np.mean(critic_losses),
+            f"{logging_prefix}/cql_loss": np.mean(cql_losses),
+            f"{logging_prefix}/average_q_values": np.mean(q_values),
+            f"{logging_prefix}/average_q_next_values": np.mean(q_next_values),
+            f"{logging_prefix}/average_reward": np.mean(reward_values),
+            f"{logging_prefix}/average_actor_log_pis": np.mean(actor_log_pis),
+        }
+
+        if len(ent_coef_losses) > 0:
+            metrics_dict[f"{logging_prefix}/ent_coef_loss"] = np.mean(ent_coef_losses)
+
+        if self.use_calibrated_q:
+            metrics_dict[f"{logging_prefix}/bound_rate_cal_ql"] = bound_rate_cal_ql
+            metrics_dict[f"{logging_prefix}/bound_rate_next_cal_ql"] = (
+                bound_rate_next_cal_ql
+            )
+
+        for metric in metrics_dict:
+            self.logger.record(metric, metrics_dict[metric])
+
+        return metrics_dict
+
+    def learn(
+        self,
+        total_timesteps: int,
+        callback: MaybeCallback = None,
+        log_interval: int = 4,
+        tb_log_name: str = "SAC",
+        reset_num_timesteps: bool = True,
+        progress_bar: bool = False,
+        logger: Optional = None,
+    ):
+        return super().learn(
+            total_timesteps=total_timesteps,
+            callback=callback,
+            log_interval=log_interval,
+            tb_log_name=tb_log_name,
+            reset_num_timesteps=reset_num_timesteps,
+            progress_bar=progress_bar,
+            logger=logger,
+        )
+
+    def _excluded_save_params(self) -> List[str]:
+        return super()._excluded_save_params() + [
+            "actor",
+            "critic",
+            "critic_target",
+        ]  # noqa: RUF005
+
+    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
+        state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
+        if self.ent_coef_optimizer is not None:
+            saved_pytorch_variables = ["log_ent_coef"]
+            state_dicts.append("ent_coef_optimizer")
+        else:
+            saved_pytorch_variables = ["ent_coef_tensor"]
+        return state_dicts, saved_pytorch_variables

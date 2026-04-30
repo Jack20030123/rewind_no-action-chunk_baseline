@@ -1,0 +1,43 @@
+# @package _global_
+
+defaults:
+  - _self_
+
+# Because RLPD is slower, we will log more frequently
+logging:
+  eval_freq: 10000
+  video_freq: 20000
+  wandb_group_name: "${reward_model.name}_${general_training.algo}_${environment.env_id}_no_action_chunk"
+
+general_training:
+  algo: rlpd
+  name: wsrl_iql
+  action_noise: 0.0 # sigma
+  learning_rate: 1e-3
+
+  # offline rl parameters
+  n_critics: 10
+  n_critics_to_sample: 2
+
+  # RLPD-specific parameters
+  rlpd_train_critic_with_entropy: false
+  # Note: RLPD's offline step uses default params defined in base_config.yaml
+  rlpd_offline_algo: iql
+
+model:
+  policy_layer_norm: true
+  critic_layer_norm: true
+  pi_net_arch: [768, 512, 256]
+  qf_net_arch: [768, 512, 256]
+
+offline_training:
+  offline_training_steps: 100000
+  # ckpt_path: "/data/shared/roboclip/metaworld_pretrain_policy/metaworld_sparse_pretrain_100k/last_offline"  # Path to load checkpoint from, if provided will skip offline training
+  critic_update_ratio: 1
+
+online_training:
+  total_time_steps: 100000
+  mix_buffers_ratio: 0.0 # WSRL does not use old replay buffer
+  warm_start_online_rl: true # main change for WSRL
+  learning_starts: 4000
+  critic_update_ratio: 4

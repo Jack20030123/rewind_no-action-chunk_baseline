@@ -1,0 +1,29 @@
+# @package _global_
+
+defaults:
+  - _self_
+
+logging:
+  eval_freq: 5000
+  video_freq: 10000
+
+general_training:
+  algo: ppo
+  name: ppo
+  action_noise: null # sigma
+  learning_rate: 1e-4
+  n_steps: 2048
+
+model:
+  policy_layer_norm: true
+  critic_layer_norm: true
+  pi_net_arch: [768, 512, 256]
+  vf_net_arch: [768, 512, 512]
+  
+offline_training:
+  offline_training_steps: 0 # SAC is online-only
+  
+
+online_training:
+  total_time_steps: 500000
+  mix_buffers_ratio: 0.0

@@ -1,0 +1,27 @@
+# @package _global_
+
+defaults:
+  - _self_
+
+
+offline_training:
+  offline_h5_path: "metaworld_traj_15_demos_sparse.h5"
+  offline_tasks: ["window-open-v2", "window-close-v2", "door-open-v2", "drawer-open-v2", "faucet-open-v2"]
+  offline_training_steps: 0
+
+online_training:
+  total_time_steps: 1000000
+
+general_training:
+  seed: 42
+
+environment:
+  cfg_name: "metaworld_some_tasks_15"
+  n_envs: 1
+  train_freq_num: 1
+  train_freq_type: 'step'
+  env_id: "coffee-button-v2" # eval task
+
+# Reward divisor is environment-dependent
+reward_model:
+  reward_divisor: 1.0

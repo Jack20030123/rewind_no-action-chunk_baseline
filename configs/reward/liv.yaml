@@ -1,0 +1,23 @@
+# @package _global_
+
+reward_model: 
+  name: 'liv'
+  batch_size: 64
+  model_path: '${oc.env:LIV_CKPT,checkpoints/liv_snapshot_10000.pt}'
+  use_pca: false
+  success_bonus: 200.0
+  reward_divisor: 1
+  reward_at_every_step: true
+  last_frame_reward_only: true
+
+general_training:
+  dense_rewards_at_end: false
+  learning_rate: 1e-3
+  entropy_term: "auto"
+# environment:
+#   is_state_based: false
+
+# offline_training:
+#   offline_training_steps: 1
+
+# data/h5_buffers/updated_trajs/metaworld_traj_15_demos_roboclipv2.h5

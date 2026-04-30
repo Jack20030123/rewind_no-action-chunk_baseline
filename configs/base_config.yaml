@@ -1,0 +1,91 @@
+defaults:
+  - _self_
+  - metaworld: null
+  - algorithm: null
+  - reward: null
+
+wandb_notes: ""
+
+logging:
+  wandb: false
+  wandb_entity_name: null
+  wandb_project_name: null
+  wandb_group_name: "${reward_model.name}_${general_training.algo}_${environment.env_id}_pure_rewind"
+  log_dir: "./logs/${logging.wandb_group_name}_${general_training.seed}"
+  eval_freq: 20000
+  video_freq: 5000
+
+general_training:
+  algo: null # Set to null so you must set algorithm yaml
+  n_steps: 128
+  seed: 0
+  pretrained: false
+  action_noise: null
+  learning_rate: 1e-3
+  dense_rewards_at_end: false
+  entropy_term: "auto"
+  normalize_reward: false
+  terminate_on_success: true
+
+  # offline rl parameters
+  critic_update_ratio: 1 # iql and cql
+  gamma: 0.99
+
+  # IQL-specific parameters
+  policy_extraction: 'awr' # awr or ddpg
+  awr_advantage_temp: 0.5 # iql only
+  ddpg_bc_weight: 0. # iql only
+  
+  # CQL-specific parameters
+  cql_min_q_weight: 1.0
+  cql_min_q_temp: 1.0
+  use_calibrated_q: false # calibrated QL https://arxiv.org/pdf/2303.05479
+
+  # below not used for now
+  random_reset: false
+  norm_input: false
+  norm_output: false
+  time_reward: 1.0
+  threshold_reward: false
+  time_penalty: 0.0
+
+
+online_training:
+  total_time_steps: 1000000
+  mix_buffers_ratio: 0.50 # Ratio of offline data during online training. Set to 0 for no offline data
+  warm_start_online_rl: true
+  learning_starts: 4000
+
+offline_training:
+  offline_h5_path: null # Set to null so you must set environment yaml
+  offline_training_steps: 100000
+  offline_tasks: ["opening window"]
+  ckpt_path: null
+
+model:
+  policy_layer_norm: true
+  critic_layer_norm: true
+  pi_net_arch: [256, 256]
+  qf_net_arch: [256, 256]
+
+reward_model: 
+  name: null # Set to null so you must set reward_model yaml
+  batch_size: 128
+  model_path: null
+  success_bonus: 10.0
+  normalize_reward: false
+  reward_at_every_step: true
+
+environment:
+  text_string: null # Set to null so you must set environment yaml
+  n_envs: 1
+  train_freq_num: 1
+  train_freq_type: 'step'
+  dir_add: ""
+  video_path: null
+  pca_path: null
+  transform_base_path: null
+  transform_model_path: null
+  ignore_language: false
+  is_state_based: false
+  use_proprio: true
