@@ -44,8 +44,12 @@ module load mesa-glu/9.0.2
 module load glew/2.2.0
 module load glx/1.4
 
+# Some conda activate.d scripts read optional variables before defining them.
+# Keep strict mode for our script, but relax nounset only while activating conda.
+set +u
 source /apps/conda/miniforge3/25.11.0-1/etc/profile.d/conda.sh
 conda activate "${CONDA_ENV}"
+set -u
 
 export LD_PRELOAD="$(g++ -print-file-name=libstdc++.so.6)"
 export MUJOCO_GL=egl
